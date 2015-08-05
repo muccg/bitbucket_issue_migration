@@ -40,8 +40,8 @@ def read_arguments():
     )
 
     parser.add_argument(
-        "bitbucket_username",
-        help="Your Bitbucket username"
+        "bitbucket_accountname",
+        help="Account owner of bitbucket repository"
     )
 
     parser.add_argument(
@@ -68,6 +68,12 @@ def read_arguments():
     parser.add_argument(
         "-f", "--start_id", type=int, dest="start", default=0,
         help="Bitbucket issue id from which to start import"
+    )
+
+    parser.add_argument(
+        "-u", "--bitbucket-username",
+        action="store_true", dest="bitbucket_username", default=False,
+        help="Use a password for bitbucket (default is anonymous access)."
     )
 
     return parser.parse_args()
@@ -146,7 +152,7 @@ def clean_body(body):
 
 
 # Bitbucket fetch
-def get_issues(bb_url, start_id):
+def get_issues(bb_url, start_id, bb):
     '''
     Fetch the issues from Bitbucket
     '''
@@ -159,7 +165,7 @@ def get_issues(bb_url, start_id):
         )
 
         try:
-            response = urllib2.urlopen(url)
+            response = bb.open(url)
         except urllib2.HTTPError as ex:
             ex.message = (
                 'Problem trying to connect to bitbucket ({url}): {ex} '
@@ -179,7 +185,7 @@ def get_issues(bb_url, start_id):
     return issues
 
 
-def get_comments(bb_url, issue):
+def get_comments(bb_url, issue, bb):
     '''
     Fetch the comments for a Bitbucket issue
     '''
@@ -187,7 +193,7 @@ def get_comments(bb_url, issue):
         bb_url,
         issue['local_id']
     )
-    result = json.loads(urllib2.urlopen(url).read())
+    result = json.loads(bb.open(url).read())
     ordered = sorted(result, key=lambda comment: comment["utc_created_on"])
 
     comments = []
@@ -206,6 +212,34 @@ def get_comments(bb_url, issue):
 
     return comments
 
+def get_milestones(bb_url, bb):
+    url = "{}/milestones/".format(bb_url)
+    result = json.loads(bb.open(url).read())
+    return [m["name"] for m in result]
+
+def get_components(bb_url, bb):
+    url = "{}/components/".format(bb_url)
+    result = json.loads(bb.open(url).read())
+    return [c["name"] for c in result]
+
+def setup_labels(gh_username, gh_repository, milestones, components):
+    IMPORT_COLOR = "888888"
+    MILESTONE_COLOR = "cccccc"
+    COMPONENT_COLOR = "357ebd"
+
+    labels = ([("import", IMPORT_COLOR)] +
+              [(m, MILESTONE_COLOR) for m in milestones] +
+              [(c, COMPONENT_COLOR) for c in components])
+
+    for label, color in labels:
+        github.issues.labels.create(
+            {
+                "name": label,
+                "color": color,
+            },
+            user=gh_username,
+            repo=gh_repository,
+        )
 
 # GitHub push
 def push_issue(gh_username, gh_repository, issue, body, comments):
@@ -219,14 +253,16 @@ def push_issue(gh_username, gh_repository, issue, body, comments):
         gh_username,
         gh_repository
     )
-
+    auth = {
+        "user": gh_username,
+        "repo": gh_repository
+    }
     # Set the status and labels
     if issue.get('status') == 'resolved':
         github.issues.update(
             new_issue.number,
             {'state': 'closed'},
-            user=gh_username,
-            repo=gh_repository
+            **auth
         )
 
     # Everything else is done with labels in github
@@ -250,14 +286,12 @@ def push_issue(gh_username, gh_repository, issue, body, comments):
     #     repo=gh_repository
     # )
 
-    # github.issues.labels.add_to_issue(
-    #     new_issue.number,
-    #     gh_username,
-    #     gh_repository,
-    #     ('import',)
-    # )
+    labels = filter(bool, ["import",
+                           issue["metadata"].get("milestone", None),
+                           issue["metadata"].get("component", None)])
 
-    # Milestones
+    # Labels
+    github.issues.labels.add_to_issue(new_issue.number, *labels, **auth)
 
     # Add the comments
     for comment in comments:
@@ -272,26 +306,46 @@ def push_issue(gh_username, gh_repository, issue, body, comments):
         issue['title'], len(comments)
     )
 
+def get_bitbucket_opener(username):
+    if username:
+        password = getpass.getpass("Please enter your Bitbucket password\n")
+        return auth_basic_opener(username, password)
+    else:
+        return urllib2.build_opener()
+
+def auth_basic_opener(username, password)
+    password_mgr = urllib2.HTTPPasswordMgrWithDefaultRealm()
+    top_level_url = "https://bitbucket.org/"
+    password_mgr.add_password(None, top_level_url, username, password)
+    handler = urllib2.HTTPBasicAuthHandler(password_mgr)
+    return urllib2.build_opener(handler)
 
 if __name__ == "__main__":
     options = read_arguments()
     bb_url = "https://api.bitbucket.org/1.0/repositories/{}/{}/issues".format(
-        options.bitbucket_username,
+        options.bitbucket_accountname,
         options.bitbucket_repo
     )
 
+    bbopen = get_bitbucket_opener(options.bitbucket_username)
+
+    milestones = get_milestones(bb_url, bbopen)
+    components = get_components(bb_url, bbopen)
+
     # fetch issues from Bitbucket
-    issues = get_issues(bb_url, options.start)
+    issues = get_issues(bb_url, options.start, bbopen)
 
     # push them in GitHub (issues comments are fetched here)
     github_password = getpass.getpass("Please enter your GitHub password\n")
     github = Github(login=options.github_username, password=github_password)
     gh_username, gh_repository = options.github_repo.split('/')
 
+    setup_labels(gh_username, gh_repository, milestones, components)
+
     # Sort issues, to sync issue numbers on freshly created GitHub projects.
     # Note: not memory efficient, could use too much memory on large projects.
     for issue in sorted(issues, key=lambda issue: issue['local_id']):
-        comments = get_comments(bb_url, issue)
+        comments = get_comments(bb_url, issue, bbopen)
 
         if options.dry_run:
             print "Title: {}".format(issue.get('title').encode('utf-8'))
